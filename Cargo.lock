@@ -3387,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "sockudo"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "ahash",
  "async-nats",
@@ -3411,7 +3411,6 @@ dependencies = [
  "http-body-util",
  "hyper 1.6.0",
  "hyper-util",
- "lazy_static",
  "md5",
  "moka",
  "prometheus",
