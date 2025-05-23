@@ -1,26 +1,29 @@
 use crate::adapter::ConnectionHandler;
-
-use crate::protocol::messages::{
-    BatchPusherApiMessage, InfoQueryParser, PusherApiMessage, PusherMessage,
-};
-use crate::utils;
-use crate::websocket::SocketId;
-use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
-    response::{IntoResponse, Response as AxumResponse},
-    Json,
-};
-// use chrono::Duration; // Duration seems unused in this file after changes
+use crate::app::auth::AuthValidator; // Added for API auth
 use crate::app::config::App; // To access app limits
 use crate::protocol::constants::EVENT_NAME_MAX_LENGTH as DEFAULT_EVENT_NAME_MAX_LENGTH;
-use crate::utils::validate_channel_name;
+use crate::protocol::messages::{
+    ApiMessageData, BatchPusherApiMessage, InfoQueryParser, PusherApiMessage, PusherMessage,
+};
+use crate::utils::{self, validate_channel_name};
+use crate::websocket::SocketId;
+use axum::{
+    Json,
+    extract::{Path, Query, RawQuery, State}, // Added RawQuery
+    http::{HeaderMap, HeaderValue, Response, StatusCode, Uri, header}, // Added Uri
+    response::{IntoResponse, Response as AxumResponse},
+};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc}; // Added fmt for AppError Display
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, HashMap}, // Added BTreeMap
+    sync::Arc,
+};
 use sysinfo::System;
 use thiserror::Error;
 use tracing::{error, field, info, instrument, warn};
+
 // --- Custom Error Type ---
 
 #[derive(Debug, Error)]
@@ -29,6 +32,8 @@ pub enum AppError {
     AppNotFound(String),
     #[error("Application validation failed: {0}")]
     AppValidationFailed(String),
+    #[error("API request authentication failed: {0}")]
+    ApiAuthFailed(String),
     #[error("Channel validation failed: Missing 'channels' or 'channel' field")]
     MissingChannelInfo,
     #[error("User connection termination failed: {0}")]
@@ -52,6 +57,7 @@ impl IntoResponse for AppError {
             AppError::AppValidationFailed(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": msg }))
             }
+            AppError::ApiAuthFailed(msg) => (StatusCode::FORBIDDEN, json!({ "error": msg })),
             AppError::MissingChannelInfo => (
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Request must contain 'channels' (list) or 'channel' (string)" }),
@@ -73,22 +79,15 @@ impl IntoResponse for AppError {
             AppError::LimitExceeded(msg) => (StatusCode::BAD_REQUEST, json!({ "error": msg })),
             AppError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, json!({ "error": msg })),
         };
-
-        // Log the error using the tracing crate, including the specific error message and status code.
-        // The `Display` implementation from `thiserror` will be used for `%self`.
         error!(error.message = %self, status_code = %status, "HTTP request failed");
         (status, Json(error_message)).into_response()
     }
 }
 
-// Implementation to convert from the global `crate::error::Error` to the local `AppError`.
-// This allows the `?` operator to work seamlessly in Axum handlers.
 impl From<crate::error::Error> for AppError {
     fn from(err: crate::error::Error) -> Self {
-        // Log the original error for more detailed backend logs before converting.
         warn!(original_error = ?err, "Converting internal error to AppError for HTTP response");
         match err {
-            // Specific mappings:
             crate::error::Error::InvalidAppKey => {
                 AppError::AppNotFound(format!("Application key not found or invalid: {}", err))
             }
@@ -96,12 +95,8 @@ impl From<crate::error::Error> for AppError {
             crate::error::Error::InvalidChannelName(s) => {
                 AppError::InvalidInput(format!("Invalid channel name: {}", s))
             }
-            crate::error::Error::ChannelError(s) => AppError::InvalidInput(s), // Or map to InternalError if more appropriate
-            crate::error::Error::AuthError(s) => AppError::AppValidationFailed(s), // Or a more specific auth-related AppError
-
-            // General fallback mapping:
-            // Most other internal errors can be mapped to a generic InternalServerError for the client.
-            // The specific `err.to_string()` will provide some context.
+            crate::error::Error::ChannelError(s) => AppError::InvalidInput(s),
+            crate::error::Error::AuthError(s) => AppError::ApiAuthFailed(s),
             _ => AppError::InternalError(err.to_string()),
         }
     }
@@ -109,7 +104,9 @@ impl From<crate::error::Error> for AppError {
 
 // --- Query Parameter Structs ---
 
-#[derive(Deserialize, Debug)]
+// This struct is used by Axum to deserialize the known Pusher auth query parameters.
+// It's also passed to `validate_pusher_api_request` to easily access these specific values.
+#[derive(Deserialize, Debug, Clone)]
 pub struct EventQuery {
     #[serde(default)]
     pub auth_key: String,
@@ -127,6 +124,9 @@ pub struct EventQuery {
 pub struct ChannelQuery {
     #[serde(default)]
     pub info: Option<String>,
+    // EventQuery fields are flattened here for GET requests that also need specific endpoint params
+    #[serde(flatten)]
+    pub auth_params: EventQuery,
 }
 
 #[derive(Deserialize, Debug)]
@@ -135,6 +135,9 @@ pub struct ChannelsQuery {
     pub filter_by_prefix: Option<String>,
     #[serde(default)]
     pub info: Option<String>,
+    // EventQuery fields are flattened here
+    #[serde(flatten)]
+    pub auth_params: EventQuery,
 }
 
 // --- Response Structs ---
@@ -163,16 +166,15 @@ fn build_cache_payload(event_name: &str, event_data: &Value) -> Result<String, s
 }
 
 /// Records API metrics (helper async function)
-#[instrument(skip(handler, incoming_request_size, outgoing_response_size), fields(app_id = %app_id))] // Renamed parameters for clarity
+#[instrument(skip(handler, incoming_request_size, outgoing_response_size), fields(app_id = %app_id))]
 async fn record_api_metrics(
     handler: &Arc<ConnectionHandler>,
     app_id: &str,
-    incoming_request_size: usize, // Renamed for clarity (e.g. size of incoming batch or single event)
-    outgoing_response_size: usize, // Renamed for clarity (size of HTTP response body)
+    incoming_request_size: usize,
+    outgoing_response_size: usize,
 ) {
     if let Some(metrics_arc) = &handler.metrics {
         let metrics = metrics_arc.lock().await;
-        // Pass the sizes as they are: incoming_request_size and outgoing_response_size
         metrics.mark_api_message(app_id, incoming_request_size, outgoing_response_size);
         info!(
             incoming_bytes = incoming_request_size,
@@ -227,26 +229,29 @@ pub async fn usage() -> Result<impl IntoResponse, AppError> {
 
 /// Helper to process a single event and return channel info if requested
 #[instrument(skip(handler, event_data, app), fields(app_id = app.id, event_name = field::Empty))]
-async fn process_single_event(
+async fn process_single_event_parallel(
     handler: &Arc<ConnectionHandler>,
     app: &App,
     event_data: PusherApiMessage,
     collect_info: bool,
 ) -> Result<HashMap<String, Value>, AppError> {
+    // Destructure the incoming event data
     let PusherApiMessage {
         name,
-        data: event_payload_data,
+        data: event_payload_data, // This is Option<ApiMessageData>
         channels,
         channel,
-        socket_id: original_socket_id_str,
-        info,
+        socket_id: original_socket_id_str, // Option<String>
+        info,                              // Option<String>
     } = event_data;
 
+    // Validate and get the event name
     let event_name_str = name
         .as_deref()
         .ok_or_else(|| AppError::InvalidInput("Event name is required".to_string()))?;
     tracing::Span::current().record("event_name", event_name_str);
 
+    // Check event name length against app limits
     let max_event_name_len = app
         .max_event_name_length
         .unwrap_or(DEFAULT_EVENT_NAME_MAX_LENGTH as u32);
@@ -257,10 +262,11 @@ async fn process_single_event(
         )));
     }
 
+    // Check event payload size against app limits
     if let Some(max_payload_kb) = app.max_event_payload_in_kb {
         let value_for_size_calc = match &event_payload_data {
-            Some(crate::protocol::messages::ApiMessageData::String(s)) => json!(s),
-            Some(crate::protocol::messages::ApiMessageData::Json(j_val)) => j_val.clone(),
+            Some(ApiMessageData::String(s)) => json!(s),
+            Some(ApiMessageData::Json(j_val)) => j_val.clone(),
             None => json!(null),
         };
         let payload_size_bytes = utils::data_to_bytes_flexible(vec![value_for_size_calc]);
@@ -272,9 +278,10 @@ async fn process_single_event(
         }
     }
 
+    // Map the original socket ID string to SocketId type
     let mapped_socket_id: Option<SocketId> = original_socket_id_str.map(SocketId);
-    let name_clone_for_message = name.clone();
 
+    // Determine the list of target channels for this event
     let target_channels: Vec<String> = match channels {
         Some(ch_list) if !ch_list.is_empty() => {
             if let Some(max_ch_at_once) = app.max_event_channels_at_once {
@@ -301,125 +308,176 @@ async fn process_single_event(
         }
     };
 
-    let mut channels_info_map = HashMap::new();
+    // Create a collection of futures, one for each channel to process.
+    // These futures will be executed concurrently by `join_all`.
+    let channel_processing_futures = target_channels.into_iter().map(|target_channel_str| {
+        // Clone data needed for each concurrent task.
+        // Arc clones are cheap. Owned data (String, Option<String>, etc.) is cloned.
+        let handler_clone = Arc::clone(handler);
+        // `app` is a reference (&App), it will be captured by the async block.
+        // This is safe as `join_all` awaits futures within `app`'s lifetime.
+        let name_for_task = name.clone(); // Option<String>
+        let payload_for_task = event_payload_data.clone(); // Option<ApiMessageData>
+        let socket_id_for_task = mapped_socket_id.clone(); // Option<SocketId>
+        let info_for_task = info.clone(); // Option<String>
+        let event_name_for_task = event_name_str.to_string(); // String
 
-    for target_channel_str in target_channels {
-        info!(channel = %target_channel_str, "Processing channel for event");
+        async move {
+            // This block processes a single channel.
+            info!(channel = %target_channel_str, "Processing channel for event (parallel task)");
 
-        validate_channel_name(app, &target_channel_str).await?;
+            // Validate the channel name.
+            // `app` is captured by reference from the outer scope.
+            validate_channel_name(app, &target_channel_str).await?;
 
-        let message_to_send = PusherApiMessage {
-            name: name_clone_for_message.clone(),
-            data: event_payload_data.clone(),
-            channels: None,
-            channel: Some(target_channel_str.clone()),
-            socket_id: mapped_socket_id.as_ref().map(|sid| sid.0.clone()),
-            info: info.clone(),
-        };
+            // Construct the message to be sent to this specific channel.
+            let message_to_send = PusherApiMessage {
+                name: name_for_task, // Use cloned name
+                data: payload_for_task.clone(), // Clone payload again for this message
+                channels: None,
+                channel: Some(target_channel_str.clone()),
+                socket_id: socket_id_for_task.as_ref().map(|sid| sid.0.clone()),
+                info: info_for_task.clone(), // Use cloned info
+            };
 
-        handler
-            .send_message(
-                &app.id,
-                mapped_socket_id.as_ref(),
-                message_to_send,
-                &target_channel_str,
-            )
-            .await;
+            // Send the message via the connection handler.
+            handler_clone
+                .send_message(
+                    &app.id,
+                    socket_id_for_task.as_ref(),
+                    message_to_send,
+                    &target_channel_str,
+                )
+                .await;
 
-        if collect_info {
-            let is_presence_channel = target_channel_str.starts_with("presence-");
-            let mut current_channel_info_map = serde_json::Map::new();
+            // If info collection is requested, gather details for this channel.
+            let mut collected_channel_specific_info: Option<(String, Value)> = None;
+            if collect_info {
+                let is_presence = target_channel_str.starts_with("presence-");
+                let mut current_channel_info_map = serde_json::Map::new();
 
-            if is_presence_channel && info.as_deref().map_or(false, |s| s.contains("user_count")) {
-                match handler
-                    .channel_manager
-                    .read()
-                    .await
-                    .get_channel_members(&app.id, &target_channel_str)
-                    .await
+                // Get user count for presence channels if requested.
+                if is_presence && info_for_task.as_deref().map_or(false, |s| s.contains("user_count")) {
+                    match handler_clone
+                        .channel_manager
+                        .read()
+                        .await
+                        .get_channel_members(&app.id, &target_channel_str)
+                        .await
+                    {
+                        Ok(members_map) => {
+                            current_channel_info_map
+                                .insert("user_count".to_string(), json!(members_map.len()));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get user count for channel {}: {} (internal error: {:?})",
+                                target_channel_str, e, e
+                            );
+                        }
+                    }
+                }
+
+                // Get subscription count if requested.
+                if info_for_task
+                    .as_deref()
+                    .map_or(false, |s| s.contains("subscription_count"))
                 {
-                    Ok(members_map) => {
-                        current_channel_info_map
-                            .insert("user_count".to_string(), json!(members_map.len()));
+                    let count = handler_clone
+                        .connection_manager
+                        .lock()
+                        .await
+                        .get_channel_socket_count(&app.id, &target_channel_str)
+                        .await;
+                    current_channel_info_map.insert("subscription_count".to_string(), json!(count));
+                }
+
+                if !current_channel_info_map.is_empty() {
+                    collected_channel_specific_info = Some((
+                        target_channel_str.clone(),
+                        Value::Object(current_channel_info_map),
+                    ));
+                }
+            }
+
+            // Handle caching for cacheable channels.
+            if utils::is_cache_channel(&target_channel_str) {
+                // Use the payload cloned for the task (payload_for_task)
+                let payload_value_for_cache = match payload_for_task {
+                    Some(ApiMessageData::String(s)) => json!(s),
+                    Some(ApiMessageData::Json(j_val)) => j_val, // Already a Value
+                    None => json!(null),
+                };
+
+                // Attempt to build the cache payload string.
+                match build_cache_payload(&event_name_for_task, &payload_value_for_cache) {
+                    Ok(cache_payload_str) => {
+                        let mut cache_manager_locked = handler_clone.cache_manager.lock().await;
+                        let cache_key_str =
+                            format!("app:{}:channel:{}:cache_miss", &app.id, target_channel_str);
+
+                        // Attempt to set the cache entry.
+                        match cache_manager_locked
+                            .set(&cache_key_str, &cache_payload_str, 3600) // TTL is 1 hour
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(channel = %target_channel_str, cache_key = %cache_key_str, "Cached event for channel");
+                            }
+                            Err(e) => {
+                                error!(channel = %target_channel_str, cache_key = %cache_key_str, error = %e, "Failed to cache event (internal error: {:?})", e);
+                            }
+                        }
                     }
                     Err(e) => {
-                        warn!(
-                            "{}",
-                            format!(
-                            "Failed to get user count for channel {}: {} (internal error: {:?})",
-                            target_channel_str, e, e
-                        )
-                        );
+                        // Log error and continue without caching, task itself doesn't fail here.
+                        error!(channel = %target_channel_str, error = %e, "Failed to serialize event data for caching");
                     }
                 }
             }
-
-            if info
-                .as_deref()
-                .map_or(false, |s| s.contains("subscription_count"))
-            {
-                let count = handler
-                    .connection_manager
-                    .lock()
-                    .await
-                    .get_channel_socket_count(&app.id, &target_channel_str)
-                    .await;
-                current_channel_info_map.insert("subscription_count".to_string(), json!(count));
-            }
-
-            if !current_channel_info_map.is_empty() {
-                channels_info_map.insert(
-                    target_channel_str.clone(),
-                    Value::Object(current_channel_info_map),
-                );
-            }
+            // Return the collected info for this channel, or None if no info was collected.
+            // The overall Result wraps this for error propagation from validation, etc.
+            Ok(collected_channel_specific_info)
         }
+    });
 
-        if utils::is_cache_channel(&target_channel_str) {
-            let payload_for_cache = match event_payload_data.clone() {
-                Some(data_val) => serde_json::to_value(data_val)?,
-                None => json!(null),
-            };
+    // Execute all channel processing futures concurrently.
+    let results: Vec<Result<Option<(String, Value)>, AppError>> =
+        join_all(channel_processing_futures).await;
 
-            let cache_payload_str = match build_cache_payload(event_name_str, &payload_for_cache) {
-                Ok(payload) => payload,
-                Err(e) => {
-                    error!( channel = %target_channel_str, error = %e, "Failed to serialize event data for caching");
-                    continue;
-                }
-            };
-
-            let mut cache_manager_locked = handler.cache_manager.lock().await;
-            let cache_key_str =
-                format!("app:{}:channel:{}:cache_miss", &app.id, target_channel_str);
-
-            match cache_manager_locked
-                .set(&cache_key_str, &cache_payload_str, 3600)
-                .await
-            {
-                Ok(_) => {
-                    info!(channel = %target_channel_str, cache_key = %cache_key_str, "Cached event for channel");
-                }
-                Err(e) => {
-                    error!(channel = %target_channel_str, cache_key = %cache_key_str, error = %e, "Failed to cache event (internal error: {:?})", e);
-                }
+    // Aggregate results from all tasks.
+    let mut final_channels_info_map = HashMap::new();
+    for result in results {
+        match result {
+            Ok(Some((channel_name, info_value))) => {
+                // If info was collected for a channel, add it to the map.
+                final_channels_info_map.insert(channel_name, info_value);
+            }
+            Ok(None) => {
+                // No info collected for this channel, or info collection was not requested.
+            }
+            Err(e) => {
+                // If any task failed (e.g., validation error), propagate the error immediately.
+                // This maintains the original function's fail-fast behavior.
+                return Err(e);
             }
         }
     }
 
-    Ok(channels_info_map)
+    // Return the aggregated map of channel information.
+    Ok(final_channels_info_map)
 }
 
 /// POST /apps/{app_id}/events
 #[instrument(skip(handler, event_payload), fields(app_id = %app_id))]
 pub async fn events(
     Path(app_id): Path<String>,
-    Query(_query): Query<EventQuery>,
+    Query(auth_q_params_struct): Query<EventQuery>, // Axum deserializes known auth params here
     State(handler): State<Arc<ConnectionHandler>>,
-    Json(event_payload): Json<PusherApiMessage>,
+    uri: Uri, // To get the request path (e.g., "/apps/app_id_123/events")
+    RawQuery(raw_query_str_option): RawQuery, // Gets the raw query string (e.g., "auth_key=abc&auth_timestamp=123...")
+    Json(event_payload): Json<PusherApiMessage>, // The JSON body of the request
 ) -> Result<impl IntoResponse, AppError> {
-    info!("{}", format!("Received event: {:?}", event_payload));
-
     let app = handler
         .app_manager
         .find_by_id(app_id.as_str())
@@ -429,7 +487,7 @@ pub async fn events(
     let need_channel_info = event_payload.info.is_some();
 
     let channels_info_map =
-        process_single_event(&handler, &app, event_payload, need_channel_info).await?;
+        process_single_event_parallel(&handler, &app, event_payload, need_channel_info).await?;
 
     if need_channel_info && !channels_info_map.is_empty() {
         let response_payload = json!({
@@ -442,23 +500,29 @@ pub async fn events(
 }
 
 /// POST /apps/{app_id}/batch_events
-#[instrument(skip(handler, batch_message_payload), fields(app_id = %app_id, batch_len = field::Empty))]
+#[instrument(skip_all, fields(app_id = %app_id, batch_len = field::Empty))]
 pub async fn batch_events(
     Path(app_id): Path<String>,
+    Query(auth_q_params_struct): Query<EventQuery>,
     State(handler): State<Arc<ConnectionHandler>>,
+    uri: Uri,
+    RawQuery(raw_query_str_option): RawQuery,
     Json(batch_message_payload): Json<BatchPusherApiMessage>,
 ) -> Result<impl IntoResponse, AppError> {
+    let body_bytes = serde_json::to_vec(&batch_message_payload)?;
     let batch_events_vec = batch_message_payload.batch;
     let batch_len = batch_events_vec.len();
     tracing::Span::current().record("batch_len", &batch_len);
     info!("Received batch events request with {} events", batch_len);
 
+    // Fetch app configuration once.
     let app_config = handler
         .app_manager
         .find_by_id(app_id.as_str())
         .await?
         .ok_or_else(|| AppError::AppNotFound(app_id.clone()))?;
 
+    // Validate batch size against app limits.
     if let Some(max_batch) = app_config.max_event_batch_size {
         if batch_len > max_batch as usize {
             return Err(AppError::LimitExceeded(format!(
@@ -468,53 +532,86 @@ pub async fn batch_events(
         }
     }
 
-    let incoming_request_size_bytes = serde_json::to_vec(&batch_events_vec)?.len();
-
-    let mut batch_response_info_vec = Vec::new();
+    let incoming_request_size_bytes = body_bytes.len(); // Use length of already serialized body_bytes
     let mut any_message_requests_info = false;
 
-    for single_event_message in batch_events_vec {
+    // Determine if any event in the batch requests info.
+    // This needs to be done before creating tasks if tasks are to conditionally collect info.
+    // However, process_single_event_parallel already takes a `collect_info` boolean.
+    // We can pass this boolean per task.
+    for single_event_message in &batch_events_vec {
+        // Iterate by reference first
         if single_event_message.info.is_some() {
             any_message_requests_info = true;
+            break;
         }
+    }
 
-        let channel_info_map_for_event = process_single_event(
-            &handler,
-            &app_config,
-            single_event_message.clone(),
-            single_event_message.info.is_some(),
-        )
-        .await?;
+    // Create a collection of futures for processing each event in the batch.
+    let event_processing_futures = batch_events_vec.into_iter().map(|single_event_message| {
+        // Clone Arcs and capture references/owned data for the async task.
+        let handler_clone = Arc::clone(&handler);
+        let app_config_ref = &app_config; // Reference to app_config owned by batch_events
+        // single_event_message is moved into this closure, then cloned for process_single_event_parallel
 
-        if any_message_requests_info {
-            if let Some(main_channel_for_event) =
-                single_event_message.channel.as_ref().or_else(|| {
-                    single_event_message
-                        .channels
-                        .as_ref()
-                        .and_then(|chs| chs.first())
-                })
+        async move {
+            let should_collect_info_for_this_event = single_event_message.info.is_some();
+            let channel_info_map = process_single_event_parallel(
+                &handler_clone,
+                app_config_ref,
+                single_event_message.clone(), // Clone for process_single_event_parallel
+                should_collect_info_for_this_event,
+            )
+            .await?;
+            // Return the original message (for constructing response) and the processed info map
+            Ok((single_event_message, channel_info_map))
+        }
+    });
+
+    // Execute all event processing futures concurrently.
+    let results: Vec<Result<(PusherApiMessage, HashMap<String, Value>), AppError>> =
+        join_all(event_processing_futures).await;
+
+    // Aggregate results and construct the batch response.
+    let mut batch_response_info_vec = Vec::with_capacity(batch_len);
+    let mut processed_event_data = Vec::with_capacity(batch_len);
+
+    for result_item in results {
+        processed_event_data.push(result_item?); // Propagate the first error encountered.
+    }
+
+    // Now, construct the response based on the successfully processed events.
+    if any_message_requests_info {
+        for (original_msg, channel_info_map_for_event) in processed_event_data {
+            // This logic for extracting main_channel_for_event and info is from the original loop.
+            if let Some(main_channel_for_event) = original_msg
+                .channel
+                .as_ref()
+                .or_else(|| original_msg.channels.as_ref().and_then(|chs| chs.first()))
             {
                 batch_response_info_vec.push(
                     channel_info_map_for_event
                         .get(main_channel_for_event)
                         .cloned()
-                        .unwrap_or_else(|| json!({})),
+                        .unwrap_or_else(|| json!({})), // Default to empty object if no specific info
                 );
             } else {
+                // If no main channel could be determined (should be rare if validation passed),
+                // push an empty object.
                 batch_response_info_vec.push(json!({}));
             }
         }
     }
 
+    // Construct the final JSON response payload.
     let final_response_payload = if any_message_requests_info {
         json!({ "batch": batch_response_info_vec })
     } else {
-        json!({ "ok": true })
+        json!({}) // Pusher API expects an empty JSON object {} for success if no info requested.
     };
 
+    // Record metrics and return the response.
     let outgoing_response_size_bytes_vec = serde_json::to_vec(&final_response_payload)?;
-
     record_api_metrics(
         &handler,
         &app_id,
@@ -522,7 +619,6 @@ pub async fn batch_events(
         outgoing_response_size_bytes_vec.len(),
     )
     .await;
-
     info!("{}", "Batch events processed successfully");
     Ok((StatusCode::OK, Json(final_response_payload)))
 }
@@ -531,11 +627,12 @@ pub async fn batch_events(
 #[instrument(skip(handler), fields(app_id = %app_id, channel = %channel_name))]
 pub async fn channel(
     Path((app_id, channel_name)): Path<(String, String)>,
-    Query(query_params): Query<ChannelQuery>,
+    Query(query_params_specific): Query<ChannelQuery>, // Contains specific params like 'info' AND flattened auth_params
     State(handler): State<Arc<ConnectionHandler>>,
+    uri: Uri,
+    RawQuery(raw_query_str_option): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
     info!("Request for channel info for channel: {}", channel_name);
-
     let app = handler
         .app_manager
         .find_by_id(&app_id)
@@ -544,7 +641,7 @@ pub async fn channel(
 
     validate_channel_name(&app, &channel_name).await?;
 
-    let info_query_str = query_params.info.as_ref();
+    let info_query_str = query_params_specific.info.as_ref(); // Use specific params from ChannelQuery
     let wants_subscription_count = info_query_str.wants_subscription_count();
     let wants_user_count = info_query_str.wants_user_count();
     let wants_cache_data = info_query_str.wants_cache();
@@ -604,10 +701,8 @@ pub async fn channel(
         user_count_val,
         cache_data_tuple,
     );
-
     let response_json_bytes = serde_json::to_vec(&response_payload)?;
     record_api_metrics(&handler, &app_id, 0, response_json_bytes.len()).await;
-
     info!("Channel info for '{}' retrieved successfully", channel_name);
     Ok((StatusCode::OK, Json(response_payload)))
 }
@@ -616,13 +711,18 @@ pub async fn channel(
 #[instrument(skip(handler), fields(app_id = %app_id))]
 pub async fn channels(
     Path(app_id): Path<String>,
-    Query(query_params): Query<ChannelsQuery>,
+    Query(query_params_specific): Query<ChannelsQuery>, // Contains specific params AND flattened auth_params
     State(handler): State<Arc<ConnectionHandler>>,
+    uri: Uri,
+    RawQuery(raw_query_str_option): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
     info!("Request for channels list for app_id: {}", app_id);
 
-    let filter_prefix_str = query_params.filter_by_prefix.as_deref().unwrap_or("");
-    let wants_user_count = query_params.info.as_ref().wants_user_count();
+    let filter_prefix_str = query_params_specific
+        .filter_by_prefix
+        .as_deref()
+        .unwrap_or("");
+    let wants_user_count = query_params_specific.info.as_ref().wants_user_count();
     let app = handler
         .app_manager
         .find_by_id(&app_id)
@@ -638,16 +738,13 @@ pub async fn channels(
     }
 
     let mut channels_info_response_map = HashMap::new();
-
     for entry in channels_map.iter() {
         let channel_name_str = entry.key();
         if !channel_name_str.starts_with(filter_prefix_str) {
             continue;
         }
         validate_channel_name(&app, channel_name_str).await?;
-
         let mut current_channel_info_map = serde_json::Map::new();
-
         if wants_user_count {
             if channel_name_str.starts_with("presence-") {
                 let members_map = handler
@@ -663,22 +760,19 @@ pub async fn channels(
                 ));
             }
         }
-
         if !current_channel_info_map.is_empty() {
             channels_info_response_map.insert(
                 channel_name_str.clone(),
                 Value::Object(current_channel_info_map),
             );
-        } else if query_params.info.is_none() {
+        } else if query_params_specific.info.is_none() {
             channels_info_response_map.insert(channel_name_str.clone(), json!({}));
         }
     }
 
     let response_payload = PusherMessage::channels_list(channels_info_response_map);
-
     let response_json_bytes = serde_json::to_vec(&response_payload)?;
     record_api_metrics(&handler, &app_id, 0, response_json_bytes.len()).await;
-
     info!("Channels list for app '{}' retrieved successfully", app_id);
     Ok((StatusCode::OK, Json(response_payload)))
 }
@@ -687,6 +781,7 @@ pub async fn channels(
 #[instrument(skip(handler), fields(app_id = %app_id, channel = %channel_name))]
 pub async fn channel_users(
     Path((app_id, channel_name)): Path<(String, String)>,
+    Query(auth_q_params_struct): Query<EventQuery>, // Only auth params for this GET endpoint
     State(handler): State<Arc<ConnectionHandler>>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = handler
@@ -709,17 +804,13 @@ pub async fn channel_users(
         .await
         .get_channel_members(&app_id, &channel_name)
         .await?;
-
     let users_vec = channel_members_map
         .keys()
         .map(|user_id_str| json!({ "id": user_id_str }))
         .collect::<Vec<_>>();
-
     let response_payload_val = json!({ "users": users_vec });
     let response_json_bytes = serde_json::to_vec(&response_payload_val)?;
-
     record_api_metrics(&handler, &app_id, 0, response_json_bytes.len()).await;
-
     info!(
         user_count = users_vec.len(),
         "Channel users for '{}' retrieved successfully", channel_name
@@ -731,7 +822,12 @@ pub async fn channel_users(
 #[instrument(skip(handler), fields(app_id = %app_id, user_id = %user_id))]
 pub async fn terminate_user_connections(
     Path((app_id, user_id)): Path<(String, String)>,
+    Query(auth_q_params_struct): Query<EventQuery>, // Auth params for this POST endpoint
     State(handler): State<Arc<ConnectionHandler>>,
+    uri: Uri,
+    RawQuery(raw_query_str_option): RawQuery,
+    // This endpoint typically does not have a body, but if it could, it would be:
+    // axum::body::Bytes(body_bytes_payload): axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     info!(
         "Received request to terminate user connections for user_id: {}",
@@ -744,7 +840,6 @@ pub async fn terminate_user_connections(
         .await
         .terminate_connection(&app_id, &user_id)
         .await?;
-
     info!(
         "Successfully initiated termination for user_id: {}",
         user_id
@@ -759,11 +854,9 @@ pub async fn up(
     State(handler): State<Arc<ConnectionHandler>>,
 ) -> Result<impl IntoResponse, AppError> {
     info!("Health check received for app_id: {}", app_id);
-
     if handler.app_manager.find_by_id(&app_id).await?.is_none() {
         warn!("Health check for non-existent app_id: {}", app_id);
     }
-
     if handler.metrics.is_some() {
         record_api_metrics(&handler, &app_id, 0, 2).await;
     } else {
@@ -772,12 +865,10 @@ pub async fn up(
             app_id
         );
     }
-
     let response_val = Response::builder()
         .status(StatusCode::OK)
         .header("X-Health-Check", "OK")
         .body("OK".to_string())?;
-
     Ok(response_val)
 }
 
@@ -787,7 +878,6 @@ pub async fn metrics(
     State(handler): State<Arc<ConnectionHandler>>,
 ) -> Result<impl IntoResponse, AppError> {
     info!("{}", "Metrics endpoint called");
-
     let plaintext_metrics_str = match handler.metrics.clone() {
         Some(metrics_arc) => {
             let metrics_data_guard = metrics_arc.lock().await;
@@ -801,13 +891,11 @@ pub async fn metrics(
             "# Metrics collection is not enabled.\n".to_string()
         }
     };
-
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
-
     info!(
         bytes = plaintext_metrics_str.len(),
         "Successfully generated Prometheus metrics"

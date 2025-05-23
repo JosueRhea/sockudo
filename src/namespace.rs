@@ -12,10 +12,10 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 // use std::collections::HashSet; // HashSet seems unused
-use std::sync::atomic::{AtomicU32, Ordering}; // Added AtomicU32 and Ordering
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering}; // Added AtomicU32 and Ordering
 use tokio::io::WriteHalf;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 // use tokio::sync::Semaphore; // Semaphore seems unused
 
@@ -387,10 +387,8 @@ impl Namespace {
                 .iter()
                 .map(async |ws_ref| {
                     let mut ws = ws_ref.0.lock().await;
-                    ws.close(
-                        4009,
-                        "You got disconnected by the app.".to_string(),
-                    ).await;
+                    ws.close(4009, "You got disconnected by the app.".to_string())
+                        .await;
                 })
                 .collect();
 

@@ -2,7 +2,8 @@ use crate::queue::{ArcJobProcessorFn, QueueInterface};
 use crate::webhook::sender::JobProcessorFnAsync;
 use crate::webhook::types::JobData;
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::cluster::ClusterClient;
+use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, RedisResult};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -11,32 +12,39 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-pub struct RedisQueueManager {
-    redis_connection: Arc<Mutex<MultiplexedConnection>>,
+pub struct RedisClusterQueueManager {
+    redis_connection: Arc<Mutex<ClusterConnection>>,
     // Store Arc'd callbacks to allow cloning them into worker tasks safely
     job_processors: dashmap::DashMap<String, ArcJobProcessorFn, ahash::RandomState>,
     prefix: String,
     concurrency: usize,
 }
 
-impl RedisQueueManager {
-    /// Creates a new RedisQueueManager instance.
-    /// Connects to Redis and returns a Result.
+impl RedisClusterQueueManager {
+    /// Creates a new RedisClusterQueueManager instance.
+    /// Connects to Redis Cluster and returns a Result.
     pub async fn new(
-        redis_url: &str,
+        cluster_nodes: Vec<String>,
         prefix: &str,
         concurrency: usize,
     ) -> crate::error::Result<Self> {
-        let client = redis::Client::open(redis_url).map_err(|e| {
-            crate::error::Error::Config(format!("Failed to open Redis client: {}", e))
-        })?; // Use custom error type
+        let client = ClusterClient::new(cluster_nodes.clone()).map_err(|e| {
+            crate::error::Error::Config(format!("Failed to create Redis cluster client: {}", e))
+        })?;
 
-        let connection = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| {
-                crate::error::Error::Connection(format!("Failed to get Redis connection: {}", e))
-            })?; // Use custom error type
+        let connection = client.get_async_connection().await.map_err(|e| {
+            crate::error::Error::Connection(format!(
+                "Failed to get Redis cluster connection: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            "Connected to Redis cluster with {} nodes, prefix: {}, concurrency: {}",
+            cluster_nodes.len(),
+            prefix,
+            concurrency
+        );
 
         Ok(Self {
             redis_connection: Arc::new(Mutex::new(connection)),
@@ -46,10 +54,10 @@ impl RedisQueueManager {
         })
     }
 
-    // Note: start_processing is effectively done within process_queue for Redis
+    // Note: start_processing is effectively done within process_queue for Redis Cluster
     #[allow(dead_code)]
     pub fn start_processing(&self) {
-        // This method is not strictly needed for Redis as workers start in process_queue.
+        // This method is not strictly needed for Redis Cluster as workers start in process_queue.
         // Could be used for other setup if required in the future.
     }
 
@@ -59,8 +67,8 @@ impl RedisQueueManager {
 }
 
 #[async_trait]
-impl QueueInterface for RedisQueueManager {
-    /// Adds a job to the specified Redis queue (list).
+impl QueueInterface for RedisClusterQueueManager {
+    /// Adds a job to the specified Redis cluster queue (list).
     /// Serializes the job data to JSON.
     async fn add_to_queue(&self, queue_name: &str, data: JobData) -> crate::error::Result<()>
     where
@@ -76,12 +84,12 @@ impl QueueInterface for RedisQueueManager {
             .await
             .map_err(|e| {
                 crate::error::Error::Queue(format!(
-                    "Redis RPUSH failed for queue {}: {}",
+                    "Redis Cluster RPUSH failed for queue {}: {}",
                     queue_name, e
                 ))
             })?; // Use custom error type
 
-        // info!("{}", format!("Added job to Redis queue: {}", queue_name)); // Optional: reduce log verbosity
+        // info!("{}", format!("Added job to Redis cluster queue: {}", queue_name)); // Optional: reduce log verbosity
 
         Ok(())
     }
@@ -106,7 +114,7 @@ impl QueueInterface for RedisQueueManager {
         info!(
             "{}",
             format!(
-                "Registered processor and starting workers for Redis queue: {}",
+                "Registered processor and starting workers for Redis cluster queue: {}",
                 queue_name
             )
         );
@@ -122,7 +130,7 @@ impl QueueInterface for RedisQueueManager {
                 info!(
                     "{}",
                     format!(
-                        "Starting Redis queue worker {} for queue: {}",
+                        "Starting Redis cluster queue worker {} for queue: {}",
                         i, worker_queue_name
                     )
                 );
@@ -131,7 +139,7 @@ impl QueueInterface for RedisQueueManager {
                     let blpop_result: RedisResult<Option<(String, String)>> = {
                         // Type hint for clarity
                         let mut conn = worker_redis_conn.lock().await;
-                        // Use BLPOP with a timeout (e.g., 1 second)
+                        // Use BLPOP with a timeout (e.g., 0.01 second)
                         conn.blpop(&worker_queue_key, 0.01).await
                     };
 
@@ -143,10 +151,10 @@ impl QueueInterface for RedisQueueManager {
                                     // Execute the job processing callback
                                     match worker_processor(job_data).await {
                                         Ok(_) => {
-                                            info!("{}", "Worker finished".to_string());
+                                            info!("{}", "Cluster worker finished".to_string());
                                         }
                                         Err(e) => {
-                                            error!("{}", format!("Worker error: {}", e));
+                                            error!("{}", format!("Cluster worker error: {}", e));
                                         }
                                     }
                                 }
@@ -155,7 +163,7 @@ impl QueueInterface for RedisQueueManager {
                                     error!(
                                         "{}",
                                         format!(
-                                            "[Worker {}] Error deserializing job data from Redis queue {}: {}. Data: '{}'",
+                                            "[Cluster Worker {}] Error deserializing job data from Redis cluster queue {}: {}. Data: '{}'",
                                             i, worker_queue_name, e, job_data_str
                                         )
                                     );
@@ -173,11 +181,11 @@ impl QueueInterface for RedisQueueManager {
                             error!(
                                 "{}",
                                 format!(
-                                    "[Worker {}] Redis BLPOP error on queue {}: {}",
+                                    "[Cluster Worker {}] Redis cluster BLPOP error on queue {}: {}",
                                     i, worker_queue_name, e
                                 )
                             );
-                            // Avoid hammering Redis on persistent errors
+                            // Avoid hammering Redis cluster on persistent errors
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -193,9 +201,17 @@ impl QueueInterface for RedisQueueManager {
         let keys: Vec<String> = conn
             .keys(format!("{}:queue:*", self.prefix))
             .await
-            .expect("Error fetching keys");
+            .map_err(|e| {
+                crate::error::Error::Queue(format!(
+                    "Redis cluster disconnect error fetching keys: {}",
+                    e
+                ))
+            })?;
+
         for key in keys {
-            conn.del::<_, ()>(&key).await.expect("Error deleting key");
+            if let Err(e) = conn.del::<_, ()>(&key).await {
+                error!("Error deleting key {} during disconnect: {}", key, e);
+            }
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 use crate::cache::manager::CacheManager;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
-use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 use std::time::Duration;
 
 /// Configuration for the Redis cache manager
@@ -144,7 +144,7 @@ impl CacheManager for RedisCacheManager {
             .keys(pattern)
             .await
             .map_err(|e| Error::CacheError(format!("Redis keys error: {}", e)))?;
-        
+
         Ok(())
     }
 

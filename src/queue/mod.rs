@@ -2,8 +2,8 @@ use crate::error::Result;
 use crate::webhook::sender::JobProcessorFnAsync;
 use crate::webhook::types::JobData;
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod manager;
 pub mod memory_queue_manager;
 pub mod redis_queue_manager;
+pub mod redis_cluster_queue_manager; // Add this line
 pub mod sqs_queue_manager;
 
 impl JobData where JobData: Serialize + DeserializeOwned {}

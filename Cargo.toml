@@ -1,12 +1,15 @@
 [package]
 name = "sockudo"
-version = "0.1.0"
-edition = "2021"
+version = "1.1.0"
+edition = "2024"
+repository = "https://github.com/RustNSparks/sockudo"
+license = "AGPL-3.0-only"
+license-file = "LICENSE"
+description = "A simple, fast, and secure WebSocket server for real-time applications."
 
 [dependencies]
 axum = { version = "^0.8.4", features = ["ws"] }
 tokio = { version = "^1", features = ["full"] }
-tower = "0.5.2"
 tower-http = { version = "^0.6.4", features = ["cors"] }
 fastwebsockets = { version = "0.10.0", features = [
     "upgrade",
@@ -17,8 +20,8 @@ fastwebsockets = { version = "0.10.0", features = [
 ] }
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
-thiserror = "2.0.9"
-dashmap = "6.1.0"
+thiserror = "^2.0.9"
+dashmap = "^6.1.0"
 futures = "0.3.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -27,13 +30,12 @@ hmac = "0.13.0-pre.4"
 sha2 = "0.11.0-pre.4"
 hex = "0.4.3"
 rand = "0.9.0"
-hyper-util = "0.1.10"
-hyper = "1.5.0"
-colored = "*"
-chrono = "*"
-sysinfo = "*"
+hyper-util = "^0.1.10"
+hyper = "^1.5.0"
+chrono = "^0.4.41"
+sysinfo = "^0.35.1"
 async-trait = "0.1.83"
-redis = { version = "0.31.0", features = ["tokio-comp", "json", "cluster", "cluster-async"] }
+redis = { version = "^0.31.0", features = ["tokio-comp", "json", "cluster", "cluster-async"] }
 sqlx = { version = "0.8.3", features = ["runtime-tokio", "mysql", "postgres"] }
 aws-config = { version = "^1.6", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1.71.1"
@@ -49,10 +51,14 @@ aws-sdk-sqs = "1.65.0"
 async-nats = "0.41.0"
 aws-sdk-lambda = "1.76.0"
 url = { version = "2.3.1", features = ["serde"] }
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-axum-extra = { version = "0.10.1", features = ["typed-header"] }
+axum-server = { version = "^0.7.2", features = ["tls-rustls"] }
+axum-extra = { version = "^0.10.1", features = ["typed-header"] }
 http = "1.3.1"
 ahash = "0.8.12"
+clap = { version = "4.5.38", features = ["derive"] }
+md5 = "0.7"
+serde_urlencoded = "0.7"
+http-body-util = "0.1.3"
 
 [dependencies.uuid]
 version = "1.11.0"
@@ -65,3 +71,18 @@ features = [
 [profile.release]
 codegen-units = 1
 lto = true
+
+[package.metadata.binstall]
+pkg-url = "https://github.com/RustNSparks/sockudo/releases/download/v{version}/sockudo-v{version}-{target}.{archive_ext}"
+pkg-fmt = "tgz"
+supported-targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "https://github.com/RustNSparks/sockudo/releases/download/v{version}/sockudo-v{version}-{target}.zip"
+pkg-fmt = "zip"

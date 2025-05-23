@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -94,7 +94,7 @@ impl MessageData {
 
     pub fn as_value(&self) -> Option<&Value> {
         match self {
-            MessageData::Structured { ref extra, .. } => extra.values().next(),
+            MessageData::Structured { extra, .. } => extra.values().next(),
             _ => None,
         }
     }
@@ -247,6 +247,28 @@ impl PusherMessage {
     // Helper for simple success response
     pub fn success_response() -> Value {
         json!({ "ok": true })
+    }
+
+    pub fn watchlist_online_event(user_ids: Vec<String>) -> Self {
+        Self {
+            event: Some("online".to_string()),
+            channel: None, // Watchlist events don't use channels
+            name: None,
+            data: Some(MessageData::Json(json!({
+                "user_ids": user_ids
+            }))),
+        }
+    }
+
+    pub fn watchlist_offline_event(user_ids: Vec<String>) -> Self {
+        Self {
+            event: Some("offline".to_string()),
+            channel: None,
+            name: None,
+            data: Some(MessageData::Json(json!({
+                "user_ids": user_ids
+            }))),
+        }
     }
 }
 
