@@ -3,7 +3,7 @@ FROM debian:bullseye-slim
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates openssl
 
 # Create a non-root user
-RUN groupadd --system sockudo_group && useradd --system --no-log-init -g sockudo_group sockudo_user
+# RUN groupadd --system sockudo_group && useradd --system --no-log-init -g sockudo_group sockudo_user
 
 WORKDIR /opt/sockudo
 ADD https://github.com/RustNSparks/sockudo/releases/download/v1.1.1/sockudo-v1.1.1-x86_64-unknown-linux-gnu.tar.gz /opt/sockudo/
@@ -20,7 +20,7 @@ RUN chmod +x ./sockudo
 # This step might be redundant if WORKDIR is created after USER, but good for clarity
 RUN chown -R sockudo_user:sockudo_group /opt/sockudo
 
-USER sockudo_user
+# USER sockudo_user
 
 # Expose the default Sockudo port and metrics port
 EXPOSE 6001
