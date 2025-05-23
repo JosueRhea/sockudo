@@ -9,7 +9,10 @@ RUN cargo build --release
 # Stage 2: Create the runtime image
 FROM debian:bullseye-slim
 # Or FROM alpine for a smaller image, but may require different dependencies for ca-certificates or other runtime needs (e.g., musl vs glibc)
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
 RUN groupadd --system sockudo_group && useradd --system --no-log-init -g sockudo_group sockudo_user
