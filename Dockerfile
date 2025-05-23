@@ -30,3 +30,46 @@ EXPOSE 9601
 # Ensure config.json is present at this path in the container (e.g., mounted as a volume) or configure via ENV vars
 ENTRYPOINT ["./sockudo"]
 CMD ["--config=./config.json"]
+
+
+# {
+#   "debug": false,
+#   "port": 6001,
+#   "host": "127.0.0.1",
+#   "cors": {
+#     "credentials": false,
+#     "origin": ["*"],
+#     "methods": ["GET", "POST", "OPTIONS"],
+#     "allowed_headers": [
+#       "Authorization",
+#       "Content-Type",
+#       "X-Requested-With",
+#       "Accept"
+#     ]
+#   },
+#   "app_manager": {
+#     "driver": "memory",
+#     "array": {
+#       "apps": [
+#         {
+#           "id": "app1",
+#           "key": "1234567890",
+#           "secret": "1234567890",
+#           "enable_client_messages": true,
+#           "enabled": true,
+#           "max_connections": "1000",
+#           "max_client_events_per_second": "10"
+#         }
+#       ]
+#     }
+#   },
+#   "adapter": {
+#     "driver": "local",
+#     "nats": {
+#       "requests_timeout": 5000,
+#       "prefix": "sockudo",
+#       "servers": ["nats://nats-production-8e2d.up.railway.app"],
+#       "connection_timeout_ms": 5000
+#     }
+#   }
+# }
