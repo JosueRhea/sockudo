@@ -18,7 +18,7 @@ RUN chmod +x ./sockudo
 
 # Change ownership to the non-root user
 # This step might be redundant if WORKDIR is created after USER, but good for clarity
-RUN chown -R sockudo_user:sockudo_group /opt/sockudo
+# RUN chown -R sockudo_user:sockudo_group /opt/sockudo
 
 # USER sockudo_user
 
