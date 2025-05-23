@@ -28,5 +28,14 @@
         }
       ]
     }
+  },
+  "adapter": {
+    "driver": "local",
+    "nats": {
+      "requests_timeout": 5000,
+      "prefix": "sockudo",
+      "servers": ["nats://nats-production-e139.up.railway.app/"],
+      "connection_timeout_ms": 5000
+    }
   }
 }
