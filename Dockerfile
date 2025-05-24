@@ -28,8 +28,8 @@ EXPOSE 9601
 
 # Default command (can be overridden)
 # Ensure config.json is present at this path in the container (e.g., mounted as a volume) or configure via ENV vars
-ENTRYPOINT ["./sockudo"]
-CMD ["--config=./config.json"]
+# ENTRYPOINT ["./sockudo"]
+CMD ["./sockudo","--config=./config.json"]
 
 
 # {
