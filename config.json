@@ -1,7 +1,6 @@
 {
   "debug": false,
   "port": 6001,
-  "host": "127.0.0.1",
   "cors": {
     "credentials": false,
     "origin": ["*"],
