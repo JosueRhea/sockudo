@@ -17,12 +17,12 @@
     "array": {
       "apps": [
         {
-          "id": "app1",
-          "key": "1234567890",
-          "secret": "1234567890",
-          "enable_client_messages": true,
+          "id": "iobotapp",
+          "key": "e5OgdUswSZ",
+          "secret": "ZdELICs4Ne7x634bVjV4IdoKYqFHuz7t",
+          "enable_client_messages": false,
           "enabled": true,
-          "max_connections": "1000",
+          "max_connections": "2000",
           "max_client_events_per_second": "10"
         }
       ]
