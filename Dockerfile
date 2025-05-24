@@ -16,6 +16,8 @@ RUN tar -xzf /opt/sockudo/sockudo-v1.1.1-x86_64-unknown-linux-gnu.tar.gz -C . &&
 # Ensure the binary is executable
 RUN chmod +x ./sockudo
 
+COPY config.json /opt/sockudo/config.json
+
 # Change ownership to the non-root user
 # This step might be redundant if WORKDIR is created after USER, but good for clarity
 # RUN chown -R sockudo_user:sockudo_group /opt/sockudo
