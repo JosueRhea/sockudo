@@ -36,5 +36,14 @@
       "servers": ["nats://nats-production-e139.up.railway.app/"],
       "connection_timeout_ms": 5000
     }
+  },
+  "metrics": {
+    "enabled": true,
+    "driver": "prometheus",
+    "host": "0.0.0.0",
+    "port": 9601,
+    "prometheus": {
+      "prefix": "sockudo_"
+    }
   }
 }
